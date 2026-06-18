@@ -103,6 +103,15 @@ async def websocket_interview(websocket: WebSocket, session_id: str):
             msg_type = data.get("type")
 
             if msg_type == "start_interview":
+                interviewer = data.get("interviewer") or {}
+                if interviewer.get("name"):
+                    session.detection["interviewer_name"] = interviewer["name"]
+                if interviewer.get("title"):
+                    session.detection["interviewer_title"] = interviewer["title"]
+                if interviewer.get("gender"):
+                    session.detection["interviewer_gender"] = interviewer["gender"]
+                if interviewer.get("voice"):
+                    session.detection["interviewer_voice"] = interviewer["voice"]
                 await _handle_start(websocket, session)
 
             elif msg_type == "candidate_answer":
@@ -231,9 +240,36 @@ async def _stream_response(
     )
 
 
+def _count_valid_answers(session: InterviewSession) -> int:
+    """A 'real' answer is one with at least 10 words. Blank/very short answers don't count.
+
+    NOTE: conversation_history entries are {"question", "answer", "question_number"},
+    populated by InterviewSession.record_answer — NOT {"role", "content"} messages.
+    """
+    count = 0
+    for qa in session.conversation_history:
+        answer = (qa.get("answer") or "").strip()
+        if len(answer.split()) >= 10:
+            count += 1
+    return count
+
+
 async def _handle_evaluation(websocket: WebSocket, session: InterviewSession) -> None:
     session.status = "evaluating"
     await websocket.send_json({"type": "evaluating"})
+
+    # Guard: never generate (fake) feedback when the candidate answered nothing.
+    answered = _count_valid_answers(session)
+    if answered == 0:
+        session.status = "ended"
+        await websocket.send_json({
+            "type": "evaluation_complete",
+            "evaluation": {
+                "error": "no_answers",
+                "message": "No answers recorded. Please complete at least one question.",
+            },
+        })
+        return
 
     prompt = build_evaluation_prompt(session)
     system = build_evaluation_system(session)
@@ -243,8 +279,109 @@ async def _handle_evaluation(websocket: WebSocket, session: InterviewSession) ->
     if not evaluation or "overall_score" not in evaluation:
         evaluation = _fallback_evaluation(session)
 
+    _normalize_evaluation(evaluation)
+
+    # Partial-feedback flag: 1-2 answers → warn; 3+ → full report.
+    evaluation["answered_count"] = answered
+    evaluation["partial"] = answered < 3
+
+    # Second LLM pass: honest resume-vs-JD analysis for the Resume Insights panel.
+    try:
+        evaluation["resume_analysis"] = await analyze_resume(
+            session.resume_text, session.jd_text, session.conversation_history
+        )
+    except Exception:
+        evaluation["resume_analysis"] = {
+            "resume_strengths": [], "missing_from_resume": [], "topics_to_add": [],
+        }
+
     session.evaluation = evaluation
     await websocket.send_json({"type": "evaluation_complete", "evaluation": evaluation})
+
+
+async def analyze_resume(resume_text: str, jd_text: str, interview_qa: list) -> dict:
+    """Honest resume vs. job-description analysis. Returns empty lists on any failure."""
+    prompt = f"""Analyze this resume against the job description.
+
+Resume: {resume_text}
+Job Description: {jd_text}
+Interview Performance: {str(interview_qa[:3])}
+
+Return ONLY valid JSON, no markdown, no explanation:
+{{
+  "resume_strengths": [
+    "Specific strong point from resume relevant to JD",
+    "Another strength"
+  ],
+  "missing_from_resume": [
+    "Important skill/keyword from JD not in resume",
+    "Another missing item"
+  ],
+  "topics_to_add": [
+    {{
+      "topic": "Topic name",
+      "reason": "One sentence why this matters for this role"
+    }}
+  ]
+}}
+
+Rules:
+- Only list things actually in/missing from the resume
+- Be specific — mention actual technologies, skills, certifications
+- missing_from_resume: max 5 items
+- topics_to_add: max 4 items
+- Never make up information not in the resume or JD"""
+
+    system = (
+        "You are an expert technical recruiter and resume analyst. "
+        "Return ONLY a valid JSON object — no markdown, no commentary. "
+        "Never fabricate: only reference content actually present in the resume or the job description."
+    )
+    raw = await _ollama_complete(prompt, system, temperature=0.2, num_ctx=8192)
+    result = _parse_json(raw)
+    if not isinstance(result, dict):
+        return {"resume_strengths": [], "missing_from_resume": [], "topics_to_add": []}
+
+    strengths = [_coerce_to_text(x) for x in (result.get("resume_strengths") or [])][:6]
+    missing = [_coerce_to_text(x) for x in (result.get("missing_from_resume") or [])][:5]
+    topics = []
+    for t in (result.get("topics_to_add") or [])[:4]:
+        if isinstance(t, dict):
+            topic = str(t.get("topic", "")).strip()
+            reason = str(t.get("reason", "")).strip()
+            if topic:
+                topics.append({"topic": topic, "reason": reason})
+        elif isinstance(t, str) and t.strip():
+            topics.append({"topic": t.strip(), "reason": ""})
+    return {"resume_strengths": strengths, "missing_from_resume": missing, "topics_to_add": topics}
+
+
+def _coerce_to_text(item) -> str:
+    """Flatten any stray object into a readable string so the UI never shows [object Object]."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for key in ("text", "area", "tip", "improvement", "description", "point", "detail"):
+            if item.get(key):
+                # If a dict carries both an area and a tip, join them naturally.
+                if key in ("area",) and item.get("tip"):
+                    return f"{item[key]}: {item['tip']}"
+                return str(item[key])
+        return "; ".join(str(v) for v in item.values() if v)
+    return str(item)
+
+
+def _normalize_evaluation(ev: dict) -> None:
+    """Ensure list-of-string fields are plain strings (LLMs sometimes return objects)."""
+    for field_name in ("strengths", "improvements", "recommended_study"):
+        if isinstance(ev.get(field_name), list):
+            ev[field_name] = [_coerce_to_text(x) for x in ev[field_name]]
+    for qa in ev.get("per_answer", []) or []:
+        if not isinstance(qa, dict):
+            continue
+        for field_name in ("strong_points", "weak_points", "missing_keywords"):
+            if isinstance(qa.get(field_name), list):
+                qa[field_name] = [_coerce_to_text(x) for x in qa[field_name]]
 
 
 async def _ollama_complete(
@@ -449,6 +586,19 @@ KOKORO_VOICE = "af_heart"        # Primary
 KOKORO_FALLBACK_VOICE = "af_sarah"  # If the requested voice is unavailable
 KOKORO_SPEED = 0.88              # Slightly slower = more deliberate, confident pacing
 
+# Kokoro voices the app is allowed to request (female + male interviewers).
+VALID_KOKORO_VOICES = [
+    "af_heart", "af_sarah", "af_nova",
+    "am_fenrir", "am_michael",
+    "bf_emma", "bm_george",
+]
+
+
+class SpeakRequest(BaseModel):
+    text: str
+    voice: str = "af_heart"
+    speed: float = 0.88
+
 
 def _generate_kokoro_wav(text: str, voice: str = KOKORO_VOICE, speed: float = KOKORO_SPEED) -> bytes:
     import soundfile as sf
@@ -461,8 +611,11 @@ def _generate_kokoro_wav(text: str, voice: str = KOKORO_VOICE, speed: float = KO
         samples, sample_rate = pipeline.create(text, voice=voice, speed=speed, lang="en-us")
     except Exception:
         # Fall back to a known-good voice rather than failing the sentence outright.
+        # Stay in the same gender so a male interviewer never becomes female.
+        is_male = voice[:1] in ("a", "b") and voice[1:2] == "m"
+        fallback = "am_michael" if is_male else KOKORO_FALLBACK_VOICE
         samples, sample_rate = pipeline.create(
-            text, voice=KOKORO_FALLBACK_VOICE, speed=speed, lang="en-us"
+            text, voice=fallback, speed=speed, lang="en-us"
         )
 
     buf = io.BytesIO()
@@ -491,8 +644,11 @@ async def _startup_db():
     # the core interview app still boots (auth endpoints will report errors).
     try:
         await asyncio.to_thread(authdb.init_db)
+        print("✅ Database connected")
     except Exception as e:
-        print(f"⚠️  Database init failed (auth disabled): {e}")
+        print(f"❌ Database error: {e}")
+        print("Run: brew services start postgresql@17")
+        print("Then: python setup_db.py")
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -525,10 +681,13 @@ async def signup(request: SignupRequest):
             request.password,
         )
         token = await asyncio.to_thread(authdb.create_session, user["id"])
+    except ConnectionError:
+        raise HTTPException(503, "Database unavailable. Please try again.")
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        raise HTTPException(500, f"Could not create account: {e}")
+        print(f"Signup error: {e}")
+        raise HTTPException(500, f"Signup failed: {e}")
 
     # Send welcome email (non-blocking; failures are logged, never block signup)
     asyncio.create_task(asyncio.to_thread(send_welcome_email, user["name"], user["email"]))
@@ -549,11 +708,14 @@ async def login(request: LoginRequest):
             request.password,
         )
         token = await asyncio.to_thread(authdb.create_session, user["id"])
+    except ConnectionError:
+        raise HTTPException(503, "Database unavailable. Please try again.")
     except ValueError as e:
         raise HTTPException(401, str(e))
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Login error: {e}")
         raise HTTPException(500, f"Login failed: {e}")
 
     return {
@@ -727,9 +889,13 @@ async def speak_text(request: Request):
     The client plays each sentence with a short fade-in and the given pause between them.
     """
     body = await request.json()
-    raw_text = body.get("text", "").strip()
+    raw_text = (body.get("text") or "").strip()
     voice = body.get("voice") or KOKORO_VOICE
     speed = float(body.get("speed", KOKORO_SPEED))
+
+    # Validate the requested voice; fall back to the default female voice.
+    if voice not in VALID_KOKORO_VOICES:
+        voice = KOKORO_VOICE
 
     if not raw_text:
         return Response(status_code=400, content=b"No text provided")
